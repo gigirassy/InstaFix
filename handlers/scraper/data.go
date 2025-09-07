@@ -177,33 +177,60 @@ func (i *InstaData) ScrapeData() error {
 		}
 	}
 
-	client := http.Client{Transport: transport, Timeout: timeout}
-	req, err := http.NewRequest("GET", "https://www.instagram.com/p/"+i.PostID+"/embed/captioned/", nil)
-	if err != nil {
-		return err
+	// Prepare transports: first direct, then runtime default (SOCKS-aware)
+	tryTransports := []http.RoundTripper{
+		gzhttp.Transport(transportNoProxy, gzhttp.TransportAlwaysDecompress(true)),
+		gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true)),
 	}
 
 	var body []byte
-	for retries := 0; retries < 3; retries++ {
-		err := func() error {
-			res, err := client.Do(req)
-			if err != nil {
-				return err
-			}
+	urlStr := "https://www.instagram.com/p/" + i.PostID + "/embed/captioned/"
+	var lastErr error
+
+	for idx, tr := range tryTransports {
+		client := http.Client{Transport: tr, Timeout: timeout}
+		req, err := http.NewRequest("GET", urlStr, nil)
+		if err != nil {
+			lastErr = err
+			slog.Warn("Failed to create request", "postID", i.PostID, "err", err)
+			continue
+		}
+
+		res, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			slog.Warn("Embed request failed", "postID", i.PostID, "attempt", idx, "err", err)
+			continue
+		}
+
+		func() {
 			defer res.Body.Close()
 			if res.StatusCode != 200 {
-				return errors.New("status code is not 200")
+				lastErr = errors.New("status code is not 200")
+				slog.Warn("Embed request returned non-200", "postID", i.PostID, "status", res.StatusCode, "attempt", idx)
+				return
 			}
-
 			body, err = io.ReadAll(res.Body)
 			if err != nil {
-				return err
+				lastErr = err
+				slog.Warn("Failed to read embed body", "postID", i.PostID, "attempt", idx, "err", err)
+				return
 			}
-			return nil
+			lastErr = nil
 		}()
-		if err == nil {
+
+		if lastErr == nil {
+			if idx == 1 {
+				slog.Info("Embed fetched via fallback transport (likely SOCKS)", "postID", i.PostID)
+			} else {
+				slog.Info("Embed fetched via direct transport", "postID", i.PostID)
+			}
 			break
 		}
+	}
+
+	if len(body) == 0 && lastErr != nil {
+		slog.Debug("No embed body obtained; will try GraphQL path", "postID", i.PostID, "err", lastErr)
 	}
 
 	var embedData gjson.Result
@@ -211,7 +238,6 @@ func (i *InstaData) ScrapeData() error {
 	if len(body) > 0 {
 		var scriptText []byte
 
-		// TimeSliceImpl (very fragile)
 		for _, line := range bytes.Split(body, []byte("\n")) {
 			if bytes.Contains(line, []byte("shortcode_media")) {
 				scriptText = line
@@ -220,7 +246,6 @@ func (i *InstaData) ScrapeData() error {
 		}
 
 		if len(scriptText) > 0 {
-			// Remove <script>
 			findFirstMoreThan := bytes.Index(scriptText, []byte(">"))
 			scriptText = scriptText[findFirstMoreThan+1:]
 
@@ -231,12 +256,11 @@ func (i *InstaData) ScrapeData() error {
 					break
 				}
 				if tt == js.StringToken && bytes.Contains(text, []byte("shortcode_media")) {
-					// Strip quotes from start and end
 					text = text[1 : len(text)-1]
 					unescapeData := utils.UnescapeJSONString(utils.B2S(text))
 					if !gjson.Valid(unescapeData) {
-						slog.Error("Failed to parse data from TimeSliceImpl", "postID", i.PostID, "err", err)
-						return err
+						slog.Error("Failed to parse data from TimeSliceImpl", "postID", i.PostID, "err", lastErr)
+						return lastErr
 					}
 					timeSliceData = gjson.Parse(unescapeData).Get("gql_data")
 				}
@@ -245,7 +269,6 @@ func (i *InstaData) ScrapeData() error {
 			slog.Warn("Failed to parse data from TimeSliceImpl", "postID", i.PostID, "err", "No script found")
 		}
 
-		// Scrape from embed HTML
 		embedHTML, err := scrapeFromEmbedHTML(body)
 		if err != nil {
 			slog.Warn("Failed to parse data from scrapeFromEmbedHTML", "postID", i.PostID, "err", err)
@@ -253,6 +276,71 @@ func (i *InstaData) ScrapeData() error {
 			embedData = gjson.Parse(embedHTML)
 		}
 	}
+
+	var gqlData gjson.Result
+	videoBlocked := bytes.Contains(body, []byte("WatchOnInstagram"))
+	if videoBlocked || len(body) == 0 {
+		gqlValue, err := scrapeFromGQL(i.PostID)
+		if err != nil {
+			slog.Error("Failed to scrape data from scrapeFromGQL", "postID", i.PostID, "err", err)
+		}
+		if gqlValue != nil && !bytes.Contains(gqlValue, []byte("require_login")) {
+			gqlData = gjson.Parse(utils.B2S(gqlValue)).Get("data")
+			slog.Info("Data parsed from GraphQL API", "postID", i.PostID)
+		}
+	}
+
+	if !gqlData.Exists() {
+		if timeSliceData.Exists() {
+			gqlData = timeSliceData
+			slog.Info("Data parsed from TimeSliceImpl", "postID", i.PostID)
+		} else {
+			gqlData = embedData
+			slog.Info("Data parsed from embedHTML", "postID", i.PostID)
+		}
+	}
+
+	status := gqlData.Get("status").String()
+	item := gqlData.Get("shortcode_media")
+	if !item.Exists() {
+		item = gqlData.Get("xdt_shortcode_media")
+		if !item.Exists() {
+			if status == "fail" {
+				return errors.New("scrapeFromGQL is blocked")
+			}
+			return ErrNotFound
+		}
+	}
+
+	media := []gjson.Result{item}
+	if item.Get("edge_sidecar_to_children").Exists() {
+		media = item.Get("edge_sidecar_to_children.edges").Array()
+	}
+
+	i.Username = item.Get("owner.username").String()
+	i.Caption = strings.TrimSpace(item.Get("edge_media_to_caption.edges.0.node.text").String())
+
+	i.Medias = make([]Media, 0, len(media))
+	for _, m := range media {
+		if m.Get("node").Exists() {
+			m = m.Get("node")
+		}
+		mediaURL := m.Get("video_url")
+		if !mediaURL.Exists() {
+			mediaURL = m.Get("display_url")
+		}
+		i.Medias = append(i.Medias, Media{
+			TypeName: m.Get("__typename").String(),
+			URL:      mediaURL.String(),
+		})
+	}
+
+	if len(i.Medias) == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 
 	var gqlData gjson.Result
 	videoBlocked := bytes.Contains(body, []byte("WatchOnInstagram"))
