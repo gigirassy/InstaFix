@@ -1,27 +1,33 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"instafix/handlers"
-	scraper "instafix/handlers/scraper"
-	"instafix/utils"
-	"instafix/views"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"instafix/handlers"
+	scraper "instafix/handlers/scraper"
+	"instafix/utils"
+	"instafix/views"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/net/proxy"
 )
 
 func init() {
 	// Create static folder if not exists
-	os.Mkdir("static", 0755)
+	_ = os.Mkdir("static", 0755)
 }
 
 func main() {
@@ -53,6 +59,11 @@ func main() {
 	// Initialize logging
 	slog.SetLogLoggerLevel(slog.LevelError)
 
+	// Initialize SOCKS proxy pool (if configured)
+	if err := initSocksProxyPoolFromEnv("SOCKS_PROXIES"); err != nil {
+		slog.Error("Failed to initialize SOCKS proxy pool", "err", err)
+	}
+
 	// Initialize LRU
 	gridCacheMax, err := strconv.Atoi(*gridCacheMaxFlag)
 	if err != nil || gridCacheMax <= 0 {
@@ -64,7 +75,7 @@ func main() {
 	scraper.InitDB()
 	defer scraper.DB.Close()
 
-	// Evict cache every minute
+	// Evict cache every 5 minutes
 	go func() {
 		for {
 			evictCache()
@@ -72,8 +83,9 @@ func main() {
 		}
 	}()
 
+	// pprof endpoint
 	go func() {
-		http.ListenAndServe("localhost:6060", nil)
+		_ = http.ListenAndServe("localhost:6060", nil)
 	}()
 
 	r := chi.NewRouter()
@@ -104,6 +116,118 @@ func main() {
 	if err := http.ListenAndServe(*listenAddr, r); err != nil {
 		slog.Error("Failed to listen", "err", err)
 	}
+}
+
+// initSocksProxyPoolFromEnv reads comma-separated SOCKS5 URIs from the provided env var (e.g. "socks5://user:pass@ip:1080")
+// and installs a custom http.Transport that round-robins connections through them. If the env var is empty or no valid proxies
+// are parsed, this function leaves the default client/transport alone.
+func initSocksProxyPoolFromEnv(envVar string) error {
+	raw := strings.TrimSpace(os.Getenv(envVar))
+	if raw == "" {
+		// nothing to do
+		slog.Info("SOCKS proxy pool: none configured (env var empty)", "env", envVar)
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	var dialers []proxy.Dialer
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		u, err := url.Parse(p)
+		if err != nil {
+			slog.Error("Skipping invalid SOCKS URI", "uri", p, "err", err)
+			continue
+		}
+		// Accept socks5 or socks scheme
+		if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "socks" {
+			slog.Error("Skipping unsupported scheme (use socks5)", "uri", p)
+			continue
+		}
+		host := u.Host
+		var auth *proxy.Auth
+		if u.User != nil {
+			pw, _ := u.User.Password()
+			auth = &proxy.Auth{
+				User:     u.User.Username(),
+				Password: pw,
+			}
+		}
+
+		d, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
+		if err != nil {
+			slog.Error("Failed to create SOCKS5 dialer", "uri", p, "err", err)
+			continue
+		}
+		dialers = append(dialers, d)
+	}
+
+	if len(dialers) == 0 {
+		slog.Info("SOCKS proxy pool: no valid proxies parsed, using direct connections")
+		return nil
+	}
+
+	var next uint64
+
+	// DialContext wrapper that round-robins between dialers and fails over on dial errors.
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// quick direct-dial fallback if no dialers (shouldn't happen here)
+		if len(dialers) == 0 {
+			d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+			return d.DialContext(ctx, network, addr)
+		}
+
+		// choose starting index via atomic counter. parentheses and spacing are important to avoid parser ambiguity
+		start := int((atomic.AddUint64(&next, 1) - 1)) % len(dialers)
+
+		var lastErr error
+		// try each dialer once, starting at start (simple failover)
+		for i := 0; i < len(dialers); i++ {
+			idx := (start + i) % len(dialers)
+			d := dialers[idx]
+			// x/net/proxy Dialer exposes Dial(network, addr) (no context)
+			conn, err := d.Dial(network, addr)
+			if err == nil {
+				// honor context cancellation if already done
+				select {
+				case <-ctx.Done():
+					_ = conn.Close()
+					return nil, ctx.Err()
+				default:
+					return conn, nil
+				}
+			}
+			lastErr = err
+			// otherwise try next proxy
+		}
+		// all failed
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, context.DeadlineExceeded
+	}
+
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// replace default transport & client so existing http.* calls will use the proxy pool
+	http.DefaultTransport = transport
+	http.DefaultClient = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	slog.Info("SOCKS proxy pool initialized", "proxies", len(dialers))
+	return nil
 }
 
 // Remove cache from Pebble if already expired
