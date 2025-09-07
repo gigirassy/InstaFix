@@ -512,11 +512,8 @@ func scrapeFromGQL(postID string) ([]byte, error) {
 		"server_timestamps":        {"true"},
 		"doc_id":                   {"25531498899829322"},
 	}
-	req, err := http.NewRequest("POST", "https://www.instagram.com/graphql/query/", strings.NewReader(gqlParams.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header = http.Header{
+
+	headers := http.Header{
 		"Accept":                      {"*/*"},
 		"Accept-Language":             {"en-US,en;q=0.9"},
 		"Content-Type":                {"application/x-www-form-urlencoded"},
@@ -539,11 +536,57 @@ func scrapeFromGQL(postID string) ([]byte, error) {
 		"X-Ig-App-Id":                 {"936619743392459"},
 	}
 
-	client := http.Client{Transport: transport, Timeout: timeout}
-	res, err := client.Do(req)
-	if err != nil || res == nil {
-		return nil, err
+	tryTransports := []http.RoundTripper{
+		gzhttp.Transport(transportNoProxy, gzhttp.TransportAlwaysDecompress(true)),
+		gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true)),
 	}
-	defer res.Body.Close()
-	return io.ReadAll(res.Body)
+
+	var lastErr error
+	encodedBody := gqlParams.Encode()
+
+	for idx, tr := range tryTransports {
+		client := http.Client{Transport: tr, Timeout: timeout}
+		req, err := http.NewRequest("POST", "https://www.instagram.com/graphql/query/", strings.NewReader(encodedBody))
+		if err != nil {
+			lastErr = err
+			slog.Warn("Failed to create GQL request", "postID", postID, "err", err)
+			continue
+		}
+		req.Header = headers
+
+		res, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			slog.Warn("GQL request failed", "postID", postID, "attempt", idx, "err", err)
+			continue
+		}
+
+		func() {
+			defer res.Body.Close()
+			if res.StatusCode != 200 {
+				lastErr = errors.New("status code is not 200")
+				slog.Warn("GQL returned non-200", "postID", postID, "status", res.StatusCode, "attempt", idx)
+				return
+			}
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				lastErr = err
+				slog.Warn("Failed to read GQL body", "postID", postID, "attempt", idx, "err", err)
+				return
+			}
+			lastErr = nil
+			encodedBody = string(body)
+		}()
+
+		if lastErr == nil {
+			slog.Info("GQL fetched via transport", "postID", postID, "attempt", idx)
+			return []byte(encodedBody), nil
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("failed to fetch GQL")
 }
+
