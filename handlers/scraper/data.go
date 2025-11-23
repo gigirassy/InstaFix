@@ -317,73 +317,6 @@ func (i *InstaData) ScrapeData() error {
 		media = item.Get("edge_sidecar_to_children.edges").Array()
 	}
 
-	i.Username = item.Get("owner.username").String()
-	i.Caption = strings.TrimSpace(item.Get("edge_media_to_caption.edges.0.node.text").String())
-
-	i.Medias = make([]Media, 0, len(media))
-	for _, m := range media {
-		if m.Get("node").Exists() {
-			m = m.Get("node")
-		}
-		mediaURL := m.Get("video_url")
-		if !mediaURL.Exists() {
-			mediaURL = m.Get("display_url")
-		}
-		i.Medias = append(i.Medias, Media{
-			TypeName: m.Get("__typename").String(),
-			URL:      mediaURL.String(),
-		})
-	}
-
-	if len(i.Medias) == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-
-	var gqlData gjson.Result
-	videoBlocked := bytes.Contains(body, []byte("WatchOnInstagram"))
-	// Scrape from GraphQL API only if video is blocked or embed data is empty
-	if videoBlocked || len(body) == 0 {
-		gqlValue, err := scrapeFromGQL(i.PostID)
-		if err != nil {
-			slog.Error("Failed to scrape data from scrapeFromGQL", "postID", i.PostID, "err", err)
-		}
-		if gqlValue != nil && !bytes.Contains(gqlValue, []byte("require_login")) {
-			gqlData = gjson.Parse(utils.B2S(gqlValue)).Get("data")
-			slog.Info("Data parsed from GraphQL API", "postID", i.PostID)
-		}
-	}
-
-	// If gqlData is blocked, use timeSliceData or embedData
-	if !gqlData.Exists() {
-		if timeSliceData.Exists() {
-			gqlData = timeSliceData
-			slog.Info("Data parsed from TimeSliceImpl", "postID", i.PostID)
-		} else {
-			gqlData = embedData
-			slog.Info("Data parsed from embedHTML", "postID", i.PostID)
-		}
-	}
-
-	status := gqlData.Get("status").String()
-	item := gqlData.Get("shortcode_media")
-	if !item.Exists() {
-		item = gqlData.Get("xdt_shortcode_media")
-		if !item.Exists() {
-			if status == "fail" {
-				return errors.New("scrapeFromGQL is blocked")
-			}
-			return ErrNotFound
-		}
-	}
-
-	media := []gjson.Result{item}
-	if item.Get("edge_sidecar_to_children").Exists() {
-		media = item.Get("edge_sidecar_to_children.edges").Array()
-	}
-
 	// Get username
 	i.Username = item.Get("owner.username").String()
 
@@ -589,4 +522,3 @@ func scrapeFromGQL(postID string) ([]byte, error) {
 	}
 	return nil, errors.New("failed to fetch GQL")
 }
-

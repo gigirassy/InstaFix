@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -102,6 +102,7 @@ func main() {
 	r.Get("/{username}/p/{postID}", handlers.Embed)
 	r.Get("/{username}/p/{postID}/{mediaNum}", handlers.Embed)
 	r.Get("/{username}/reel/{postID}", handlers.Embed)
+	r.Get("/share/{postID}", handlers.Embed)
 
 	r.Get("/images/{postID}/{mediaNum}", handlers.Images)
 	r.Get("/videos/{postID}/{mediaNum}", handlers.Videos)
