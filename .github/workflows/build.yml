@@ -1,4 +1,4 @@
-name: Wikidepia/InstaFix
+name: gigirassy/instafix
 on:
   push:
   workflow_dispatch:
