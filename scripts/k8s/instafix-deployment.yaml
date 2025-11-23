@@ -16,7 +16,7 @@ spec:
         app: instafix
     spec:
       containers:
-        - image: ghcr.io/wikidepia/instafix:main
+        - image: ghcr.io/gigirassy/instafix:main
           name: instafix
           ports:
             - containerPort: 3000
