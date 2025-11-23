@@ -1,26 +1,24 @@
 # InstaFix
 
+Forked from the original InstaFix, modified README below.
+
+Features added:
+* share:/hash url support.
+* option to use a SOCKS proxy.
+
+My instance does not support Telegram, sorry.
+
+
+----
+
+
 > Instagram is a trademark of Instagram, Inc. This app is not affiliated with Instagram, Inc.
 
 InstaFix serves fixed Instagram image and video embeds. Heavily inspired by [fxtwitter.com](https://fxtwitter.com).
 
 ## How to use
 
-Add `dd` before `instagram.com` to show Instagram embeds, or
-
-<img src=".github/assets/orig_embed.jpg" width="450">
-
-### Embed Media Only
-
-Add `d.dd` before `instagram.com` to show only the media.
-
-<img src=".github/assets/media_only.jpg" width="450">
-
-### Gallery View
-
-Add `g.dd` before `instagram.com` to show only the author and the media, without any caption.
-
-<img src=".github/assets/no_caption.jpg" width="450">
+Replace the first two characters of instagram.com with fx.
 
 ## Deploy InstaFix yourself (locally)
 
@@ -31,11 +29,13 @@ Add `g.dd` before `instagram.com` to show only the author and the media, without
 
 ## Deploy InstaFix yourself (cloud)
 
+**IMPORTANT:** Do not use the Instagram trademark in your website URL! This is commmonly speculated to be the reason why ddinstagram.com is no longer functional.
+
 1. Pull the latest container image from GHCR and run it.  
-   `docker pull ghcr.io/wikidepia/instafix:main`
+   `docker pull ghcr.io/gigirassy/instafix:main`
 2. Run the pulled image with Docker (bound on port 3000):  
-    `docker run -d --restart=always -p 3000:3000 ghcr.io/wikidepia/instafix:main`
-3. Optional: Use the Docker Compose file in [./scripts/docker-compose.yml](./scripts/docker-compose.yml).
+    `docker run -d --restart=always -p 3000:3000 ghcr.io/gigirassy/instafix:main`
+3. Optional: Use the Docker Compose file in [./scripts/docker-compose.yml](./scripts/docker-compose.yml). If not using Kubernetes, it's also highly recommended to add a Haproxy instance to loadbalance between 3 instances or more.
 4. Optional: Use a [Kubernetes Deployment file](./scripts/k8s/instafix-deployment.yaml) and a [Kubernetes Ingress configuration file](./scripts/k8s/instafix-ingress.yaml) to deploy to a Kubernetes cluster (with 10 replicas) by issuing `kubectl apply -f .` over the `./scripts/k8s/` folder. [TODO: CockroachDB is not shared between replicas at application level, extract Cockroach into its own Service and allow replicas to communicate to it].
 
 ## Using iOS shortcut (contributed by @JohnMcAnearney)
