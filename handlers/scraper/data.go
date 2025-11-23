@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -29,10 +30,17 @@ var (
 	RemoteScraperAddr string
 	ErrNotFound       = errors.New("post not found")
 	timeout           = 5 * time.Second
-	transport         http.RoundTripper
-	transportNoProxy  *http.Transport
-	sflightScraper    singleflight.Group
-	remoteZSTDReader  *zstd.Decoder
+
+	// pre-wrapped transports and clients to avoid allocs per request
+	transport           http.RoundTripper
+	transportGZ         http.RoundTripper
+	transportNoProxy    *http.Transport
+	transportNoProxyGZ  http.RoundTripper
+	httpClientDefault   *http.Client
+	httpClientNoProxy   *http.Client
+	sflightScraper      singleflight.Group
+	remoteZSTDReader    *zstd.Decoder
+	bufPool             sync.Pool
 )
 
 //go:embed dictionary.bin
@@ -52,13 +60,32 @@ type InstaData struct {
 
 func init() {
 	var err error
-	transport = gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true))
-	transportNoProxy = http.DefaultTransport.(*http.Transport).Clone()
-	transportNoProxy.Proxy = nil // Skip any proxy
 
+	// base transports
+	transport = http.DefaultTransport
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		transportNoProxy = dt.Clone()
+		transportNoProxy.Proxy = nil
+	} else {
+		transportNoProxy = &http.Transport{}
+	}
+
+	// pre-wrap gz transports once
+	transportGZ = gzhttp.Transport(transport, gzhttp.TransportAlwaysDecompress(true))
+	transportNoProxyGZ = gzhttp.Transport(transportNoProxy, gzhttp.TransportAlwaysDecompress(true))
+
+	httpClientDefault = &http.Client{Transport: transportGZ, Timeout: timeout}
+	httpClientNoProxy = &http.Client{Transport: transportNoProxyGZ, Timeout: timeout}
+
+	// low memory zstd decoder with dict
 	remoteZSTDReader, err = zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderDicts(zstdDict))
 	if err != nil {
 		panic(err)
+	}
+
+	// small buffer pool to reuse bytes.Buffers used for reading HTTP bodies
+	bufPool = sync.Pool{
+		New: func() interface{} { return new(bytes.Buffer) },
 	}
 }
 
@@ -148,29 +175,37 @@ func GetData(postID string) (*InstaData, error) {
 func (i *InstaData) ScrapeData() error {
 	// Scrape from remote scraper if available
 	if len(RemoteScraperAddr) > 0 {
-		remoteClient := http.Client{Transport: transportNoProxy, Timeout: timeout}
 		req, err := http.NewRequest("GET", RemoteScraperAddr+"/scrape/"+i.PostID, nil)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Accept-Encoding", "zstd.dict")
-		res, err := remoteClient.Do(req)
+
+		// reuse no-proxy client
+		res, err := httpClientNoProxy.Do(req)
 		if err == nil && res != nil {
 			defer res.Body.Close()
-			remoteData, err := io.ReadAll(res.Body)
+			buf := bufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			_, err = io.Copy(buf, res.Body)
 			if err == nil && res.StatusCode == 200 {
-				remoteDecomp, err := remoteZSTDReader.DecodeAll(remoteData, nil)
+				remoteDecomp, err := remoteZSTDReader.DecodeAll(buf.Bytes(), nil)
 				if err != nil {
+					bufPool.Put(buf)
 					return err
 				}
+				// we can return buffer early now
+				bufPool.Put(buf)
+
 				if err := binary.Unmarshal(remoteDecomp, i); err == nil {
 					if len(i.Username) > 0 {
 						slog.Info("Data parsed from remote scraper", "postID", i.PostID)
 						return nil
 					}
 				}
+			} else {
+				slog.Error("Failed to scrape data from remote scraper", "postID", i.PostID, "status", res.StatusCode, "err", err)
 			}
-			slog.Error("Failed to scrape data from remote scraper", "postID", i.PostID, "status", res.StatusCode, "err", err)
 		}
 		if err != nil {
 			slog.Error("Failed when trying to scrape data from remote scraper", "postID", i.PostID, "err", err)
@@ -179,8 +214,8 @@ func (i *InstaData) ScrapeData() error {
 
 	// Prepare transports: first direct, then runtime default (SOCKS-aware)
 	tryTransports := []http.RoundTripper{
-		gzhttp.Transport(transportNoProxy, gzhttp.TransportAlwaysDecompress(true)),
-		gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true)),
+		transportNoProxyGZ,
+		transportGZ,
 	}
 
 	var body []byte
@@ -188,7 +223,7 @@ func (i *InstaData) ScrapeData() error {
 	var lastErr error
 
 	for idx, tr := range tryTransports {
-		client := http.Client{Transport: tr, Timeout: timeout}
+		client := &http.Client{Transport: tr, Timeout: timeout}
 		req, err := http.NewRequest("GET", urlStr, nil)
 		if err != nil {
 			lastErr = err
@@ -210,12 +245,18 @@ func (i *InstaData) ScrapeData() error {
 				slog.Warn("Embed request returned non-200", "postID", i.PostID, "status", res.StatusCode, "attempt", idx)
 				return
 			}
-			body, err = io.ReadAll(res.Body)
+			buf := bufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			_, err = io.Copy(buf, res.Body)
 			if err != nil {
 				lastErr = err
 				slog.Warn("Failed to read embed body", "postID", i.PostID, "attempt", idx, "err", err)
+				bufPool.Put(buf)
 				return
 			}
+			// keep body referencing buffer bytes until we finish processing below.
+			body = append([]byte(nil), buf.Bytes()...) // make a fresh copy minimal time in memory by copying once
+			bufPool.Put(buf)
 			lastErr = nil
 		}()
 
@@ -238,16 +279,30 @@ func (i *InstaData) ScrapeData() error {
 	if len(body) > 0 {
 		var scriptText []byte
 
-		for _, line := range bytes.Split(body, []byte("\n")) {
-			if bytes.Contains(line, []byte("shortcode_media")) {
-				scriptText = line
-				break
+		// Find an occurrence of "shortcode_media" and then extract the enclosing script content line
+		if pos := bytes.Index(body, []byte("shortcode_media")); pos != -1 {
+			// find start of line (previous '\n' +1 or 0)
+			start := bytes.LastIndexByte(body[:pos], '\n')
+			if start == -1 {
+				start = 0
+			} else {
+				start = start + 1
 			}
+			// find end of line (next '\n' after pos)
+			end := bytes.IndexByte(body[pos:], '\n')
+			if end == -1 {
+				end = len(body)
+			} else {
+				end = pos + end
+			}
+			scriptText = body[start:end]
 		}
 
 		if len(scriptText) > 0 {
-			findFirstMoreThan := bytes.Index(scriptText, []byte(">"))
-			scriptText = scriptText[findFirstMoreThan+1:]
+			findFirstMoreThan := bytes.IndexByte(scriptText, '>')
+			if findFirstMoreThan >= 0 && findFirstMoreThan < len(scriptText)-1 {
+				scriptText = scriptText[findFirstMoreThan+1:]
+			}
 
 			lexer := js.NewLexer(parse.NewInputBytes(scriptText))
 			for {
@@ -256,7 +311,10 @@ func (i *InstaData) ScrapeData() error {
 					break
 				}
 				if tt == js.StringToken && bytes.Contains(text, []byte("shortcode_media")) {
-					text = text[1 : len(text)-1]
+					// trim surrounding quotes
+					if len(text) >= 2 {
+						text = text[1 : len(text)-1]
+					}
 					unescapeData := utils.UnescapeJSONString(utils.B2S(text))
 					if !gjson.Valid(unescapeData) {
 						slog.Error("Failed to parse data from TimeSliceImpl", "postID", i.PostID, "err", lastErr)
@@ -470,15 +528,15 @@ func scrapeFromGQL(postID string) ([]byte, error) {
 	}
 
 	tryTransports := []http.RoundTripper{
-		gzhttp.Transport(transportNoProxy, gzhttp.TransportAlwaysDecompress(true)),
-		gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true)),
+		transportNoProxyGZ,
+		transportGZ,
 	}
 
 	var lastErr error
 	encodedBody := gqlParams.Encode()
 
 	for idx, tr := range tryTransports {
-		client := http.Client{Transport: tr, Timeout: timeout}
+		client := &http.Client{Transport: tr, Timeout: timeout}
 		req, err := http.NewRequest("POST", "https://www.instagram.com/graphql/query/", strings.NewReader(encodedBody))
 		if err != nil {
 			lastErr = err
@@ -501,14 +559,18 @@ func scrapeFromGQL(postID string) ([]byte, error) {
 				slog.Warn("GQL returned non-200", "postID", postID, "status", res.StatusCode, "attempt", idx)
 				return
 			}
-			body, err := io.ReadAll(res.Body)
+			buf := bufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			_, err := io.Copy(buf, res.Body)
 			if err != nil {
 				lastErr = err
 				slog.Warn("Failed to read GQL body", "postID", postID, "attempt", idx, "err", err)
+				bufPool.Put(buf)
 				return
 			}
 			lastErr = nil
-			encodedBody = string(body)
+			encodedBody = string(buf.Bytes())
+			bufPool.Put(buf)
 		}()
 
 		if lastErr == nil {
