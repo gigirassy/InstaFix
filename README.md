@@ -1,5 +1,8 @@
 # InstaFix
 
+<img width="552" height="532" alt="image" src="https://github.com/user-attachments/assets/156cdfa1-3c04-4899-83c3-7dd440304fe7" />
+
+
 Forked from the original InstaFix, modified README below.
 
 Features added:
