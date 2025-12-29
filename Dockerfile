@@ -24,10 +24,15 @@ COPY views/ ./views/
 ARG TARGETARCH
 
 # Build
-RUN GOOS=linux GOARCH=$TARGETARCH go build -tags netgo,osusergo -ldflags '-extldflags "-static"'
+RUN GOOS=linux GOARCH=$TARGETARCH go build -tags netgo,osusergo -ldflags '-extldflags "-static" -s -w'
 
 # Run in scratch container
 FROM scratch
+
+ENV GOGC=20 \
+    GOMAXPROCS=1 \
+    GOMEMLIMIT=100MiB
+
 # the test program:
 COPY --from=app-builder /app/instafix /instafix
 # the tls certificates:
