@@ -41,7 +41,6 @@ var sflightGrid singleflight.Group
 func getHeight(imagesWH [][]float64, canvasWidth int) float64 {
 	var height float64
 	for _, im := range imagesWH {
-		// accumulate w/h
 		height += im[0] / im[1]
 	}
 	return float64(canvasWidth) / height
@@ -83,11 +82,16 @@ func avg(n []float64) float64 {
 }
 
 // computeLayout computes layout (path, heightRows, canvasWidth, canvasHeight) using only widths/heights (no full images).
+// IMPORTANT: imagesWH should include a terminal dummy element (0,0) at the end so path endpoint equals len(imagesWH)-1
 func computeLayout(imagesWH [][]float64) (path []int, heightRows []int, canvasWidth int, canvasHeight int, err error) {
-	// Calculate canvas width by taking the average of width of all images (approximately)
+	// Calculate canvas width by taking the average of width of all images (approx)
 	var allWidth []float64
 	allWidth = make([]float64, 0, len(imagesWH))
+	// exclude the dummy entry if present (zero width)
 	for _, im := range imagesWH {
+		if im[0] == 0 {
+			continue
+		}
 		allWidth = append(allWidth, im[0])
 	}
 	canvasWidth = int(avg(allWidth) * 1.5)
@@ -122,6 +126,7 @@ func computeLayout(imagesWH [][]float64) (path []int, heightRows []int, canvasWi
 }
 
 // renderGrid renders the canvas by decoding each image file one at a time to keep memory usage low.
+// tempFiles is expected to have N real files plus a final dummy entry (empty string) so indices line up with computeLayout.
 func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, canvasHeight int) (image.Image, error) {
 	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
 
@@ -136,8 +141,15 @@ func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, c
 		oldImWidth := 0
 
 		for idx := start; idx < end; idx++ {
-			// Open temp file and decode just this image
+			// skip the final dummy index if present
+			if idx >= len(tempFiles)-1 {
+				// no real file here; should not happen for normal rows, but guard anyway
+				continue
+			}
 			tf := tempFiles[idx]
+			if tf == "" {
+				continue
+			}
 			f, err := os.Open(tf)
 			if err != nil {
 				return nil, err
@@ -150,17 +162,19 @@ func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, c
 
 			newWidthF := float64(heightRow) * float64(img.Bounds().Dx()) / float64(img.Bounds().Dy())
 			newWidth := int(newWidthF)
+			if newWidth <= 0 {
+				newWidth = 1
+			}
 
-			// draw scaled image into canvas
 			dstRect := image.Rect(oldImWidth, oldRowHeight, oldImWidth+newWidth, oldRowHeight+heightRow)
 			draw.ApproxBiLinear.Scale(canvas, dstRect, img, img.Bounds(), draw.Src, nil)
 
-			// free img variable (help GC)
+			// free img
 			img = nil
 
 			oldImWidth += newWidth
 
-			// remove temp file to free disk
+			// remove temp file immediately to free disk
 			_ = os.Remove(tf)
 		}
 
@@ -169,11 +183,20 @@ func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, c
 	return canvas, nil
 }
 
-// GenerateGrid now accepts only image dimension metadata and returns the canvas image after rendering images from files.
+// GenerateGridFromFiles builds the layout from image configs and renders images from temp files one at a time.
 func GenerateGridFromFiles(tempFiles []string) (image.Image, error) {
-	// Build imagesWH from jpeg configs (we rely on caller having created temp files and filled them)
-	imagesWH := make([][]float64, 0, len(tempFiles))
-	for _, tf := range tempFiles {
+	// tempFiles should be length N+1 with last entry being "" (dummy)
+	n := len(tempFiles)
+	if n == 0 {
+		return nil, errors.New("no temp files")
+	}
+	// build imagesWH from real files only (exclude final dummy)
+	imagesWH := make([][]float64, 0, n)
+	for i := 0; i < n-1; i++ {
+		tf := tempFiles[i]
+		if tf == "" {
+			return nil, errors.New("missing temp file")
+		}
 		f, err := os.Open(tf)
 		if err != nil {
 			return nil, err
@@ -185,16 +208,30 @@ func GenerateGridFromFiles(tempFiles []string) (image.Image, error) {
 		}
 		imagesWH = append(imagesWH, []float64{float64(cfg.Width), float64(cfg.Height)})
 	}
+	// append dummy terminal vertex to match original algorithm
+	imagesWH = append(imagesWH, []float64{0, 0})
 
-	// compute layout
+	// compute layout (path includes the terminal dummy index)
 	path, heightRows, canvasWidth, canvasHeight, err := computeLayout(imagesWH)
 	if err != nil {
+		// cleanup temp files on error
+		for _, tf := range tempFiles {
+			if tf != "" {
+				_ = os.Remove(tf)
+			}
+		}
 		return nil, err
 	}
 
 	// render images one-by-one from tempFiles
 	canvas, err := renderGrid(tempFiles, path, heightRows, canvasWidth, canvasHeight)
 	if err != nil {
+		// cleanup temp files on error
+		for _, tf := range tempFiles {
+			if tf != "" {
+				_ = os.Remove(tf)
+			}
+		}
 		return nil, err
 	}
 	return canvas, nil
@@ -241,8 +278,11 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 	_, err, _ = sflightGrid.Do(postID, func() (interface{}, error) {
 		client := http.Client{Transport: transport, Timeout: timeout}
 
-		// Download each image to a temp file (concurrently). We do not decode them into memory.
-		tempFiles := make([]string, len(mediaURLs))
+		// tempFiles length is number of media + 1 (final dummy)
+		tempFiles := make([]string, len(mediaURLs)+1)
+		// final entry stays "" as dummy to match original GenerateGrid behavior
+		tempFiles[len(tempFiles)-1] = ""
+
 		errs := make([]error, len(mediaURLs))
 		var wg sync.WaitGroup
 
@@ -263,13 +303,11 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 				}
 				defer res.Body.Close()
 
-				// create temp file
 				tf, err := os.CreateTemp("", "gridimg_*")
 				if err != nil {
 					errs[i] = err
 					return
 				}
-				// copy stream to file (no large in-memory buffer)
 				_, err = io.Copy(tf, res.Body)
 				if err != nil {
 					tf.Close()
@@ -295,10 +333,9 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Create grid Images from temp files (uses only configs first, decodes full images one by one)
+		// Create grid from files (reads configs first, then decodes one-by-one)
 		grid, err := GenerateGridFromFiles(tempFiles)
 		if err != nil {
-			// cleanup temp files on error
 			for _, tf := range tempFiles {
 				if tf != "" {
 					_ = os.Remove(tf)
