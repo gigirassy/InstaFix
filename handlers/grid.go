@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"errors"
 	"image"
 	"image/jpeg"
@@ -61,101 +62,104 @@ func createGraph(imagesWH [][]float64, start, canvasWidth int) map[int]uint64 {
 		if i-start > 3 {
 			break
 		}
-		c := costFn(imagesWH, start, i, canvasWidth, 1000)
-		if c < 0 {
-			c = 0
-		}
-		results[i] = uint64(c)
+		results[i] = uint64(costFn(imagesWH, start, i, canvasWidth, 1000))
 	}
 	return results
 }
 
 func avg(n []float64) float64 {
+	if len(n) == 0 {
+		return 0
+	}
 	var sum float64
 	for _, v := range n {
 		sum += v
 	}
-	if len(n) == 0 {
-		return 0
-	}
 	return sum / float64(len(n))
 }
 
-// computeLayout computes layout (path, heightRows, canvasWidth, canvasHeight) using only widths/heights (no full images).
-// IMPORTANT: imagesWH should include a terminal dummy element (0,0) at the end so path endpoint equals len(imagesWH)-1
-func computeLayout(imagesWH [][]float64) (path []int, heightRows []int, canvasWidth int, canvasHeight int, err error) {
-	// Calculate canvas width by taking the average of width of all images (approx)
-	var allWidth []float64
-	allWidth = make([]float64, 0, len(imagesWH))
-	// exclude the dummy entry if present (zero width)
-	for _, im := range imagesWH {
-		if im[0] == 0 {
+// GenerateGridFromBytes does the same layout and rendering as the original GenerateGrid,
+// but receives JPEG data as compressed bytes and decodes each image one-by-one while rendering.
+func GenerateGridFromBytes(imagesData [][]byte) (image.Image, error) {
+	// Append the dummy terminal entry (same as original's image.Rect append)
+	imagesData = append(imagesData, nil)
+
+	// Build imagesWH from configs (no full decode)
+	var imagesWH [][]float64
+	imagesWH = make([][]float64, 0, len(imagesData))
+	for _, data := range imagesData {
+		if data == nil {
+			// terminal dummy
+			imagesWH = append(imagesWH, []float64{0, 0})
 			continue
 		}
-		allWidth = append(allWidth, im[0])
-	}
-	canvasWidth = int(avg(allWidth) * 1.5)
-	if canvasWidth <= 0 {
-		return nil, nil, 0, 0, errors.New("invalid canvas width")
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		imagesWH = append(imagesWH, []float64{float64(cfg.Width), float64(cfg.Height)})
 	}
 
+	// Calculate canvas width by taking the average of width of all images
+	var allWidth []float64
+	for _, imageWH := range imagesWH {
+		allWidth = append(allWidth, imageWH[0])
+	}
+	canvasWidth := int(avg(allWidth) * 1.5)
+	if canvasWidth <= 0 {
+		return nil, errors.New("invalid canvas width")
+	}
+
+	// Build graph and compute shortest path (same as original)
 	graph := dijkstra.NewGraph()
 	for i := range imagesWH {
 		graph.AddVertexAndArcs(i, createGraph(imagesWH, i, canvasWidth))
 	}
 
-	// shortest path from 0 to len(imagesWH)-1
 	best, err := graph.Shortest(0, len(imagesWH)-1)
 	if err != nil {
-		return nil, nil, 0, 0, err
+		return nil, err
 	}
-	path = best.Path
+	path := best.Path
 
-	canvasHeight = 0
-	heightRows = make([]int, 0, len(path)-1)
+	// Calculate row heights and canvas height
+	canvasHeight := 0
+	var heightRows []int
 	for i := 1; i < len(path); i++ {
 		if len(imagesWH) < path[i-1] {
-			return nil, nil, 0, 0, errors.New("imagesWH is not long enough")
+			return nil, errors.New("imagesWH is not long enough")
 		}
 		rowWH := imagesWH[path[i-1]:path[i]]
 		rowHeight := int(getHeight(rowWH, canvasWidth))
 		heightRows = append(heightRows, rowHeight)
 		canvasHeight += rowHeight
 	}
-	return path, heightRows, canvasWidth, canvasHeight, nil
-}
 
-// renderGrid renders the canvas by decoding each image file one at a time to keep memory usage low.
-// tempFiles is expected to have N real files plus a final dummy entry (empty string) so indices line up with computeLayout.
-func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, canvasHeight int) (image.Image, error) {
+	// Create the canvas
 	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
 
+	// Render: for each row, decode each image from bytes just in time, scale into canvas, then free bytes.
 	oldRowHeight := 0
-	for rowIndex := 1; rowIndex < len(path); rowIndex++ {
-		start := path[rowIndex-1]
-		end := path[rowIndex]
-		if rowIndex-1 >= len(heightRows) {
+	for i := 1; i < len(path); i++ {
+		inRowStart := path[i-1]
+		inRowEnd := path[i]
+		oldImWidth := 0
+		if len(heightRows) < i {
 			return nil, errors.New("heightRows is not long enough")
 		}
-		heightRow := heightRows[rowIndex-1]
-		oldImWidth := 0
+		heightRow := heightRows[i-1]
 
-		for idx := start; idx < end; idx++ {
-			// skip the final dummy index if present
-			if idx >= len(tempFiles)-1 {
-				// no real file here; should not happen for normal rows, but guard anyway
+		for idx := inRowStart; idx < inRowEnd; idx++ {
+			// skip terminal dummy if encountered
+			if idx < 0 || idx >= len(imagesData) {
 				continue
 			}
-			tf := tempFiles[idx]
-			if tf == "" {
+			data := imagesData[idx]
+			if data == nil {
 				continue
 			}
-			f, err := os.Open(tf)
-			if err != nil {
-				return nil, err
-			}
-			img, err := jpeg.Decode(f)
-			f.Close()
+
+			img, err := jpeg.Decode(bytes.NewReader(data))
 			if err != nil {
 				return nil, err
 			}
@@ -166,74 +170,19 @@ func renderGrid(tempFiles []string, path []int, heightRows []int, canvasWidth, c
 				newWidth = 1
 			}
 
-			dstRect := image.Rect(oldImWidth, oldRowHeight, oldImWidth+newWidth, oldRowHeight+heightRow)
-			draw.ApproxBiLinear.Scale(canvas, dstRect, img, img.Bounds(), draw.Src, nil)
+			draw.ApproxBiLinear.Scale(canvas,
+				image.Rect(oldImWidth, oldRowHeight, oldImWidth+newWidth, oldRowHeight+heightRow),
+				img, img.Bounds(), draw.Src, nil)
 
-			// free img
+			// free decoded image & compressed bytes to reduce peak usage
 			img = nil
+			imagesData[idx] = nil
 
 			oldImWidth += newWidth
-
-			// remove temp file immediately to free disk
-			_ = os.Remove(tf)
 		}
-
 		oldRowHeight += heightRow
 	}
-	return canvas, nil
-}
 
-// GenerateGridFromFiles builds the layout from image configs and renders images from temp files one at a time.
-func GenerateGridFromFiles(tempFiles []string) (image.Image, error) {
-	// tempFiles should be length N+1 with last entry being "" (dummy)
-	n := len(tempFiles)
-	if n == 0 {
-		return nil, errors.New("no temp files")
-	}
-	// build imagesWH from real files only (exclude final dummy)
-	imagesWH := make([][]float64, 0, n)
-	for i := 0; i < n-1; i++ {
-		tf := tempFiles[i]
-		if tf == "" {
-			return nil, errors.New("missing temp file")
-		}
-		f, err := os.Open(tf)
-		if err != nil {
-			return nil, err
-		}
-		cfg, err := jpeg.DecodeConfig(f)
-		f.Close()
-		if err != nil {
-			return nil, err
-		}
-		imagesWH = append(imagesWH, []float64{float64(cfg.Width), float64(cfg.Height)})
-	}
-	// append dummy terminal vertex to match original algorithm
-	imagesWH = append(imagesWH, []float64{0, 0})
-
-	// compute layout (path includes the terminal dummy index)
-	path, heightRows, canvasWidth, canvasHeight, err := computeLayout(imagesWH)
-	if err != nil {
-		// cleanup temp files on error
-		for _, tf := range tempFiles {
-			if tf != "" {
-				_ = os.Remove(tf)
-			}
-		}
-		return nil, err
-	}
-
-	// render images one-by-one from tempFiles
-	canvas, err := renderGrid(tempFiles, path, heightRows, canvasWidth, canvasHeight)
-	if err != nil {
-		// cleanup temp files on error
-		for _, tf := range tempFiles {
-			if tf != "" {
-				_ = os.Remove(tf)
-			}
-		}
-		return nil, err
-	}
 	return canvas, nil
 }
 
@@ -278,69 +227,63 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 	_, err, _ = sflightGrid.Do(postID, func() (interface{}, error) {
 		client := http.Client{Transport: transport, Timeout: timeout}
 
-		// tempFiles length is number of media + 1 (final dummy)
-		tempFiles := make([]string, len(mediaURLs)+1)
-		// final entry stays "" as dummy to match original GenerateGrid behavior
-		tempFiles[len(tempFiles)-1] = ""
+		// Limit concurrent downloads to avoid spikes (tweak concurrency as needed)
+		const maxConcurrentDownloads = 6
+		sem := make(chan struct{}, maxConcurrentDownloads)
 
+		dataSlices := make([][]byte, len(mediaURLs))
 		errs := make([]error, len(mediaURLs))
 		var wg sync.WaitGroup
 
-		for i, mediaURL := range mediaURLs {
+		for i, url := range mediaURLs {
 			wg.Add(1)
 			go func(i int, url string) {
 				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
 				req, err := http.NewRequest(http.MethodGet, url, http.NoBody)
 				if err != nil {
 					errs[i] = err
 					return
 				}
+
 				res, err := client.Do(req)
 				if err != nil {
-					slog.Error("Failed to GET image", "postID", postID, "err", err, "url", url)
+					slog.Error("Failed to get image", "postID", postID, "err", err)
 					errs[i] = err
 					return
 				}
 				defer res.Body.Close()
 
-				tf, err := os.CreateTemp("", "gridimg_*")
+				// Read compressed bytes (smaller than decoded image)
+				b, err := io.ReadAll(res.Body)
 				if err != nil {
 					errs[i] = err
 					return
 				}
-				_, err = io.Copy(tf, res.Body)
-				if err != nil {
-					tf.Close()
-					_ = os.Remove(tf.Name())
-					errs[i] = err
-					return
-				}
-				tf.Close()
-				tempFiles[i] = tf.Name()
-			}(i, mediaURL)
+				dataSlices[i] = b
+			}(i, url)
 		}
+
 		wg.Wait()
 
-		// Check for download errors and cleanup on error
+		// On any download error, cleanup and return error
 		for _, e := range errs {
 			if e != nil {
-				for _, tf := range tempFiles {
-					if tf != "" {
-						_ = os.Remove(tf)
+				for _, b := range dataSlices {
+					if b != nil {
+						// allow GC by nil-ing (no files on disk used)
+						b = nil
 					}
 				}
 				return false, e
 			}
 		}
 
-		// Create grid from files (reads configs first, then decodes one-by-one)
-		grid, err := GenerateGridFromFiles(tempFiles)
+		// Build grid image from compressed bytes (decodes one-by-one while rendering)
+		grid, err := GenerateGridFromBytes(dataSlices)
 		if err != nil {
-			for _, tf := range tempFiles {
-				if tf != "" {
-					_ = os.Remove(tf)
-				}
-			}
 			return false, err
 		}
 
