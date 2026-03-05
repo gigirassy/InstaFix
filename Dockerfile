@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine as app-builder
+FROM --platform=$BUILDPLATFORM chimeralinux/chimera:latest as app-builder
 
+RUN apk add go
 # Set destination for COPY
 WORKDIR /app
 
